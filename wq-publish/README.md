@@ -20,7 +20,7 @@ CSV、填写批次号，系统逐行校验后预览**新增 / 修改 / 撤回（
 
 ## 本地启动
 
-环境要求：Python 3.10+（仅依赖 Flask）。
+环境要求：Python 3.10+（依赖 Flask，生产启动使用 gunicorn）。
 
 ```bash
 cd wq-publish
@@ -46,6 +46,19 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 
 下游采集程序只需固定读取 `WQ_DOWNSTREAM_DIR/published_results.csv`。
 
+## Docker Compose 启动
+
+```bash
+cd wq-publish
+docker compose up --build            # 监听 http://127.0.0.1:5000
+```
+
+- 数据目录与下游目录分别挂载到宿主机 `./data`、`./downstream`（与本地启动一致），
+  容器重建或升级不会丢失登记与已发布 CSV。
+- 下游采集程序可直接读取宿主机 `./downstream/published_results.csv`，无需进入容器。
+- 生产模式使用 gunicorn 单 worker 多线程；并发正确性依赖同一对数据/下游目录，
+  不要为同一对目录启动多个 compose 栈或副本。
+
 ## 操作流程
 
 1. 打开首页，填写批次号并选择仪器导出的 CSV，点击「校验并预览增删改」。
@@ -53,6 +66,9 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 3. 校验通过：进入预览页核对新增/修改/撤回差异，可「放弃本次修订」或
    「确认无误，整批替换并发布」。
 4. 发布成功后回到首页，登记版本号递增、行数更新，下游文件已原子替换。
+5. 发布失败（如数据库/磁盘空间不足）：页面明确提示失败与当前版本；下游 CSV
+   在响应返回前已恢复为登记版本（首次发布则无正式 CSV）。释放空间后回到预览页
+   重新提交即可，无需重启，也不会重复登记或覆盖他人修订。
 
 ## 数据一致性设计（如何保证要求）
 
@@ -66,9 +82,20 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 **文件与登记的事务关系、崩溃自动恢复**
 
 - SQLite（`data/wq_publish.db`）是版本登记与全版本结果的唯一真相源，
-  发布在 `BEGIN IMMEDIATE` 事务内完成「原子换文件 → 写新版本结果 → 更新登记表」。
+  发布在 `BEGIN IMMEDIATE` 事务内完成「写新版本结果与登记（未提交）→ 临时文件 +
+  fsync + `os.replace` 原子换文件 → 提交」。
+- **发布失败不会供出未登记数据**（例如数据库空间不足）：
+  - 数据库写入在触碰下游文件之前完成，空间不足通常在换文件前就抛出，此时事务
+    回滚，下游文件原样保留完整旧版；
+  - 若失败发生在换文件之后（提交失败、文件写入失败），**在返回失败响应之前**
+    立即按数据库登记恢复完整 CSV（发布前的硬链接备份使磁盘仍满时也能恢复），
+    首次发布失败则删除未登记文件，下游读不到任何正式 CSV，全过程不依赖重启；
+  - 失败恢复与正常发布使用同一把 SQLite 写锁：若失败处理期间其他服务进程已成功
+    发布更新版本，恢复会保留其文件与登记，绝不撤销后来成功的版本；
+  - 页面明确提示「发布失败」、当前登记版本与下游文件的实际状态；修订会话保持
+    `pending`，空间恢复后可直接重新提交，仍按提交时的基线版本校验，无重复登记。
 - 每次启动（`Storage.recover()`）自动核对并修复：
-  1. 清理崩溃遗留的 `.tmp-publish-*` 临时文件；
+  1. 清理崩溃遗留的 `.tmp-publish-*` / `.prev-publish-*` 临时文件与备份链接；
   2. 正式文件缺失或 SHA256 与登记不符时，以数据库登记为准原子重建；
   3. 「文件已改名但事务未提交」的现场，重启后回滚为登记中的完整版本；
   4. 下游目录中未登记的游离文件移入 `data/quarantine/` 隔离（不直接删除）；
@@ -91,15 +118,17 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 
 覆盖 42 项断言：CSV 各类非法输入、上传→预览→发布全链路、增改删分类与撤回语义、
 同版本双页面并发冲突（409 + obsolete + 重新预览成功）、文件缺失/损坏/临时文件/
-游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护。
+游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护，以及数据库空间不足
+导致的发布失败（旧版完整保留、首次发布不留正式文件、失败恢复不撤销他人新版本、
+空间恢复后可重新提交）。
 
 `examples/` 下提供 `batch_v1.csv`、`batch_v2_revision.csv`（含增改删）与
 `batch_invalid.csv`（含重复、负数、空值）可直接在页面上演练。
 
 ## 部署提示与已知限制
 
-- `flask run` 为开发服务器；正式环境建议用 `waitress-serve --host 127.0.0.1
-  --port 5000 wsgi:create_app`（或 gunicorn 单实例多线程）。并发正确性依赖
+- `flask run` 为开发服务器；正式环境（含 Compose）使用 gunicorn 单 worker 多线程
+  （`gunicorn --workers 1 --threads N 'wsgi:create_app()'`）。并发正确性依赖
   SQLite 的 `BEGIN IMMEDIATE` 文件锁与同目录 `os.replace`，多 worker 部署时
   必须共享同一个 `WQ_DATA_DIR` 与 `WQ_DOWNSTREAM_DIR`。
 - 全量结果按版本保留在 `results` 表中，当前未提供历史版本回滚的页面入口

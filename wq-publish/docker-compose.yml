@@ -1,0 +1,14 @@
+services:
+  wq-publish:
+    build: .
+    image: wq-publish:latest
+    container_name: wq-publish
+    ports:
+      - "127.0.0.1:5000:5000"
+    environment:
+      WQ_DATA_DIR: /app/data
+      WQ_DOWNSTREAM_DIR: /app/downstream
+    volumes:
+      - ./data:/app/data
+      - ./downstream:/app/downstream
+    restart: unless-stopped

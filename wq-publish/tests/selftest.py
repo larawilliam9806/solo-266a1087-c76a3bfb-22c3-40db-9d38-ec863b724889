@@ -10,14 +10,16 @@
 import hashlib
 import io
 import os
+import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wq_publish.app import create_app
-from wq_publish.storage import LIVE_FILENAME
+from wq_publish.storage import LIVE_FILENAME, Storage
 from wq_publish.validation import render_csv, validate_csv
 
 PASS, FAIL = 0, 0
@@ -207,6 +209,172 @@ check("取消后发布被拒绝（409 且会话 cancelled）",
       and app.storage.get_session(tok)["status"] == "cancelled")
 check("取消不影响当前版本",
       app.storage.current_registry()["current_version"] == v_before)
+
+# ---------------- 7. 空间不足导致发布失败：供数一致性 ----------------
+
+def read_live():
+    with open(live, "rb") as fh:
+        return fh.read()
+
+
+def trigger_db_full(storage, sql="results"):
+    """用触发器稳定模拟 SQLITE_FULL（真实写满磁盘在测试中不可控）。"""
+    conn = sqlite3.connect(storage.db_path)
+    conn.execute(
+        f"CREATE TRIGGER wq_test_full BEFORE INSERT ON {sql} "
+        "BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END"
+    )
+    conn.commit()
+    conn.close()
+
+
+def drop_trigger(storage):
+    conn = sqlite3.connect(storage.db_path)
+    conn.execute("DROP TRIGGER IF EXISTS wq_test_full")
+    conn.commit()
+    conn.close()
+
+
+def flash_text(resp):
+    return re.findall(r'<div class="flash [^"]+">(.*?)</div>', resp.data.decode(), re.S)
+
+
+print("== 7. 数据库空间不足：已有批次失败 → 恢复原登记 CSV ==")
+base_version = app.storage.current_registry()["current_version"]
+old_live = read_live()
+old_hash = app.storage.current_registry()["content_hash"]
+r = upload(client, "batch_v2_revision.csv", "FULL-REV")
+tok_full = re.search(rb'/publish/([0-9a-f]+)', r.data).group(1).decode()
+trigger_db_full(app.storage)
+resp = client.post(f"/publish/{tok_full}")
+drop_trigger(app.storage)
+check("失败响应为 302 回首页（页面可展示错误）", resp.status_code == 302)
+page = client.get("/")
+messages = flash_text(page)
+check("页面准确提示发布失败", any("发布失败" in m for m in messages), str(messages))
+check("页面未提示发布成功", not any("发布成功" in m for m in messages))
+check("登记版本未变", app.storage.current_registry()["current_version"] == base_version)
+check("登记哈希未变", app.storage.current_registry()["content_hash"] == old_hash)
+check("下游 CSV 已恢复为完整原登记内容", read_live() == old_live)
+check("下游 CSV 哈希与登记一致",
+      hashlib.sha256(read_live()).hexdigest() == old_hash)
+check("没有残留临时文件/备份链接",
+      not [n for n in os.listdir(down_dir) if n.startswith(".tmp-")
+           or n.startswith(".prev-")])
+check("会话保持 pending，可直接重新提交",
+      app.storage.get_session(tok_full)["status"] == "pending")
+check("失败事件写入日志",
+      any(e["kind"] == "publish-failed" for e in app.storage.recent_events(20)))
+retry = client.post(f"/publish/{tok_full}")
+check("空间恢复后重新提交成功且只登记一次",
+      retry.status_code == 302
+      and app.storage.current_registry()["current_version"] == base_version + 1)
+check("重新提交后下游 CSV 与登记一致",
+      hashlib.sha256(read_live()).hexdigest()
+      == app.storage.current_registry()["content_hash"])
+
+print("== 8. 失败发生在换文件之后：返回前恢复旧版 ==")
+base_version = app.storage.current_registry()["current_version"]
+old_live = read_live()
+r = upload(client, "batch_v1.csv", "FULL-AFTER-WRITE")
+tok_after = re.search(rb'/publish/([0-9a-f]+)', r.data).group(1).decode()
+real_atomic = type(app.storage)._atomic_write.__get__(app.storage)
+
+def write_then_fail(text):
+    real_atomic(text)
+    raise sqlite3.OperationalError("database or disk is full")
+
+app.storage._atomic_write = write_then_fail
+try:
+    client.post(f"/publish/{tok_after}")
+finally:
+    app.storage._atomic_write = real_atomic
+check("换文件后失败：下游在响应前恢复完整旧版", read_live() == old_live)
+check("换文件后失败：登记未变且会话仍 pending",
+      app.storage.current_registry()["current_version"] == base_version
+      and app.storage.get_session(tok_after)["status"] == "pending")
+check("换文件后失败：无残留备份链接",
+      not [n for n in os.listdir(down_dir) if n.startswith(".prev-")])
+client.post(f"/publish/{tok_after}")
+check("恢复后重新提交成功（不重复登记）",
+      app.storage.current_registry()["current_version"] == base_version + 1)
+
+print("== 9. 首次发布失败：不得留下可读取的正式 CSV ==")
+tmp_first = tempfile.mkdtemp(prefix="wq-first-")
+first = create_app(data_dir=os.path.join(tmp_first, "data"),
+                   downstream_dir=os.path.join(tmp_first, "downstream"))
+c_first = first.test_client()
+res = c_first.post(
+    "/preview",
+    data={"batch_no": "FIRST", "csv_file": (io.BytesIO(read_example("batch_v1.csv")),
+                                           "batch_v1.csv")},
+    content_type="multipart/form-data",
+)
+tok_first = re.search(rb'/publish/([0-9a-f]+)', res.data).group(1).decode()
+trigger_db_full(first.storage)
+resp = c_first.post(f"/publish/{tok_first}")
+drop_trigger(first.storage)
+first_live = os.path.join(tmp_first, "downstream", LIVE_FILENAME)
+check("首次失败：页面提示发布失败",
+      any("发布失败" in m for m in flash_text(c_first.get("/"))))
+check("首次失败：登记仍为空", first.storage.current_registry() is None)
+check("首次失败：下游无可读取正式 CSV", not os.path.exists(first_live))
+check("首次失败：/published.csv 返回 404",
+      c_first.get("/published.csv").status_code == 404)
+check("首次失败：无残留临时文件",
+      not [n for n in os.listdir(os.path.dirname(first_live)) if n.startswith(".")])
+retry = c_first.post(f"/publish/{tok_first}")
+check("首次失败后重新提交成功登记为 v1",
+      retry.status_code == 302
+      and first.storage.current_registry()["current_version"] == 1
+      and os.path.exists(first_live))
+shutil.rmtree(tmp_first, ignore_errors=True)
+
+print("== 10. 失败恢复与并发发布交错：不撤销后来成功的版本 ==")
+tmp_race = tempfile.mkdtemp(prefix="wq-race-")
+race = create_app(data_dir=os.path.join(tmp_race, "data"),
+                  downstream_dir=os.path.join(tmp_race, "downstream"))
+c_race = race.test_client()
+res = c_race.post(
+    "/preview",
+    data={"batch_no": "RACE-V1", "csv_file": (io.BytesIO(read_example("batch_v1.csv")),
+                                             "batch_v1.csv")},
+    content_type="multipart/form-data",
+)
+c_race.post(f"/publish/{re.search(rb'/publish/([0-9a-f]+)', res.data).group(1).decode()}")
+res = c_race.post(
+    "/preview",
+    data={"batch_no": "RACE-OURS",
+          "csv_file": (io.BytesIO(read_example("batch_v2_revision.csv")),
+                       "batch_v2_revision.csv")},
+    content_type="multipart/form-data",
+)
+tok_ours = re.search(rb'/publish/([0-9a-f]+)', res.data).group(1).decode()
+other_rows = validate_csv(read_example("batch_v1.csv"), "RACE-OTHER")[0]
+tok_other = race.storage.create_session("RACE-OTHER", 1, other_rows)
+original_recover = race.storage._recover_after_failure
+real_atomic_race = type(race.storage)._atomic_write.__get__(race.storage)
+
+def other_publishes_first(**kwargs):
+    # 另一服务进程在我们失败与恢复之间成功发布了 v2
+    Storage(race.storage.data_dir, race.storage.downstream_dir).publish(tok_other)
+    return original_recover(**kwargs)
+
+race.storage._atomic_write = write_then_fail
+race.storage._recover_after_failure = other_publishes_first
+try:
+    c_race.post(f"/publish/{tok_ours}")
+finally:
+    race.storage._atomic_write = real_atomic_race
+    race.storage._recover_after_failure = original_recover
+reg = race.storage.current_registry()
+race_live = os.path.join(tmp_race, "downstream", LIVE_FILENAME)
+check("交错：登记保留其他进程成功的 v2", reg["current_version"] == 2)
+check("交错：下游文件仍是他人的 v2 完整内容",
+      hashlib.sha256(open(race_live, "rb").read()).hexdigest() == reg["content_hash"])
+check("交错：页面提示他的版本已保留，未撤销",
+      any("已保留" in m or "未撤销" in m for m in flash_text(c_race.get("/"))))
+shutil.rmtree(tmp_race, ignore_errors=True)
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")

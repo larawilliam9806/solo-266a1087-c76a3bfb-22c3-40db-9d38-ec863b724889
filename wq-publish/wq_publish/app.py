@@ -1,6 +1,7 @@
 """Flask 路由：上传校验 → 预览增删改 → 确认整批替换。"""
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import sqlite3
@@ -16,7 +17,7 @@ from flask import (
     url_for,
 )
 
-from .storage import LIVE_FILENAME, PublishConflictError, Storage
+from .storage import LIVE_FILENAME, PublishConflictError, PublishFailureError, Storage
 from .validation import format_concentration, validate_csv
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
@@ -149,6 +150,61 @@ def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -
             new_version, row_count = storage.publish(token)
         except PublishConflictError as exc:
             flash(str(exc), "error")
+            return redirect(url_for("index"))
+        except PublishFailureError as exc:
+            # 发布失败：登记未生效，下游 CSV 已在返回前按登记恢复（首次发布则移除）。
+            # 会话保持 pending，数据库/磁盘空间恢复后可直接重新提交，仍按当前版本预览。
+            app.logger.warning("publish failed: %s", exc)
+            if exc.not_started:
+                flash(
+                    f"当前有其他发布正在写入或数据库暂不可用（{exc}），"
+                    "请稍后重新提交发布，本次未产生任何数据变更",
+                    "error",
+                )
+                return redirect(url_for("index"))
+            reg = storage.current_registry()
+            current_version = reg["current_version"] if reg else 0
+            live = os.path.join(storage.downstream_dir, LIVE_FILENAME)
+            live_present = os.path.exists(live)
+            live_matches = False
+            if live_present:
+                with open(live, "rb") as fh:
+                    live_matches = (
+                        hashlib.sha256(fh.read()).hexdigest() == reg["content_hash"]
+                    ) if reg else False
+            flash(f"发布失败：{exc}。本次修订未登记，当前版本仍为 v{current_version}。",
+                  "error")
+            if exc.newer_version:
+                flash(
+                    f"期间其他页面已成功发布 v{exc.newer_version}，其版本已保留，"
+                    "未撤销。请基于当前版本重新预览后再发布。",
+                    "info",
+                )
+            elif not live_present:
+                flash(
+                    "首次发布失败，下游目录未留下可读取的正式 CSV。"
+                    "空间恢复后可直接重新提交预览并发布。",
+                    "info",
+                )
+            elif live_matches:
+                flash(
+                    f"下游 CSV 已恢复为登记 v{current_version} 的完整内容，"
+                    "下游不会读到未登记的数据。空间恢复后可直接重新提交发布。",
+                    "info",
+                )
+            else:
+                flash(
+                    "自动恢复未完成（可能空间仍然不足），请先释放数据库/磁盘空间；"
+                    "系统会在下次启动时继续按登记核对，期间下游可能读到不一致内容。",
+                    "error",
+                )
+            if not exc.repair_ok and live_present and live_matches and not exc.newer_version:
+                # 文件已实际恢复，但恢复事务未能提交（空间仍紧张）：提示核对结果
+                flash(
+                    f"下游 CSV 已按登记 v{current_version} 恢复完整，"
+                    "但恢复记录未能写入数据库；不影响下游读取。",
+                    "info",
+                )
             return redirect(url_for("index"))
         except sqlite3.OperationalError as exc:  # 极端并发下写锁等待超时
             app.logger.warning("publish lock contention: %s", exc)
